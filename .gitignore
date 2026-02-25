@@ -1,6 +1,7 @@
 .idea
 .venv
 .vscode
+.python-version
 __pycache__
 build
 data
