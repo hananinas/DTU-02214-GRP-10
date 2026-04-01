@@ -14,3 +14,7 @@ sdkconfig
 model.c
 model.h
 test_case.h
+faces/model/
+faces/esp32/build/
+faces/esp32/.cache/
+digits/outputs/

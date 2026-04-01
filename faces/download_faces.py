@@ -52,6 +52,20 @@ def extract_zip(path, extract_to):
     print(f"Extracted to {extract_to}")
 
 
+def resolve_faces_csv_dir(base_dir):
+    candidates = [
+        os.path.join(base_dir, "faces_csv"),
+        os.path.join(base_dir, "train_face_labels"),
+        os.path.join(base_dir, "yoloface_fast_predictions"),
+    ]
+
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+
+    raise FileNotFoundError("Could not find extracted face annotation directory")
+
+
 def parse_faces_csv(csv_path):
     faces = []
     if not os.path.exists(csv_path):
@@ -79,6 +93,18 @@ def parse_faces_csv(csv_path):
     return faces
 
 
+def resolve_local_image_path(image_path):
+    normalized = image_path.replace("\\", "/")
+
+    if normalized.startswith("/data/coco/train2017/"):
+        return os.path.join(DATA_DIR, "train2017", os.path.basename(normalized))
+
+    if normalized.startswith("train2017/"):
+        return os.path.join(DATA_DIR, normalized)
+
+    return os.path.join(DATA_DIR, normalized.lstrip("/"))
+
+
 def crop_faces(num_faces=10):
     os.makedirs(FACES_DIR, exist_ok=True)
 
@@ -97,9 +123,18 @@ def crop_faces(num_faces=10):
         download_gdrive(FACES_URL, faces_zip)
         extract_zip(faces_zip, DATA_DIR)
         os.remove(faces_zip)
-        os.rename(os.path.join(DATA_DIR, "train_face_labels"), faces_csv_dir)
+        extracted_dir = resolve_faces_csv_dir(DATA_DIR)
+        if extracted_dir != faces_csv_dir:
+            if os.path.exists(faces_csv_dir):
+                raise FileExistsError(
+                    f"Target directory already exists: {faces_csv_dir}"
+                )
+            os.rename(extracted_dir, faces_csv_dir)
 
-    csv_files = [f for f in os.listdir(faces_csv_dir) if f.endswith(".csv")]
+    train_faces_dir = os.path.join(faces_csv_dir, "train2017")
+    csv_root_dir = train_faces_dir if os.path.exists(train_faces_dir) else faces_csv_dir
+
+    csv_files = [f for f in os.listdir(csv_root_dir) if f.endswith(".csv")]
     print(f"Found {len(csv_files)} CSV files with face annotations")
 
     faces_found = 0
@@ -107,7 +142,7 @@ def crop_faces(num_faces=10):
         if faces_found >= num_faces:
             break
 
-        csv_path = os.path.join(faces_csv_dir, csv_file)
+        csv_path = os.path.join(csv_root_dir, csv_file)
         faces = parse_faces_csv(csv_path)
 
         if not faces:
@@ -118,7 +153,7 @@ def crop_faces(num_faces=10):
                 break
 
             img_path = face["image_path"]
-            full_img_path = os.path.join(DATA_DIR, img_path)
+            full_img_path = resolve_local_image_path(img_path)
 
             if not os.path.exists(full_img_path):
                 continue
