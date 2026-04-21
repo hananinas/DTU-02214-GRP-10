@@ -14,52 +14,47 @@ from transfer_model import (
     IMG_SIZE,
     POSITIVE_CLASS_NAME,
     build_transfer_model,
-    resolve_negative_class_dir,
     save_transfer_metadata,
 )
 
-DATA_DIR = Path(__file__).parent / "data" / "classified_faces"
+DATA_DIR = Path(__file__).parent / "data"
 
 
-def collect_samples(dataset_dir: Path) -> tuple[list[str], np.ndarray]:
-    if not dataset_dir.exists():
-        raise FileNotFoundError(
-            "Missing dataset directory: "
-            f"{dataset_dir}\n"
-            "Build it first with: uv run build_member_non_member_dirs.py"
-        )
+def collect_samples(data_dir: Path) -> tuple[list[str], np.ndarray]:
+    if not data_dir.exists():
+        raise FileNotFoundError(f"Missing data directory: {data_dir}")
 
-    member_dir = dataset_dir / POSITIVE_CLASS_NAME
-
-    try:
-        negative_dir = resolve_negative_class_dir(dataset_dir)
-    except FileNotFoundError as exc:
-        raise FileNotFoundError(
-            f"{exc}\n"
-            "Build the dataset first with: uv run build_member_non_member_dirs.py"
-        ) from exc
+    member_dir = data_dir / "member"
+    non_member_dir = data_dir / "non_member"
 
     if not member_dir.exists():
-        raise FileNotFoundError(
-            f"Missing member directory: {member_dir}\n"
-            "Build the dataset first with: uv run build_member_non_member_dirs.py"
-        )
+        raise FileNotFoundError(f"Missing member directory: {member_dir}")
+    if not non_member_dir.exists():
+        raise FileNotFoundError(f"Missing non_member directory: {non_member_dir}")
 
     paths: list[str] = []
     labels: list[int] = []
 
     for image_path in sorted(member_dir.iterdir()):
-        if image_path.is_file() and image_path.suffix.lower() in {".jpg", ".jpeg", ".png"}:
+        if image_path.is_file() and image_path.suffix.lower() in {
+            ".jpg",
+            ".jpeg",
+            ".png",
+        }:
             paths.append(str(image_path))
             labels.append(1)
 
-    for image_path in sorted(negative_dir.iterdir()):
-        if image_path.is_file() and image_path.suffix.lower() in {".jpg", ".jpeg", ".png"}:
+    for image_path in sorted(non_member_dir.iterdir()):
+        if image_path.is_file() and image_path.suffix.lower() in {
+            ".jpg",
+            ".jpeg",
+            ".png",
+        }:
             paths.append(str(image_path))
             labels.append(0)
 
     if len(paths) < 10:
-        raise ValueError(f"Not enough images found under {dataset_dir}")
+        raise ValueError(f"Not enough images found under {data_dir}")
 
     return paths, np.asarray(labels, dtype=np.float32)
 
@@ -105,14 +100,18 @@ def make_dataset(paths: Sequence[str], labels: np.ndarray, training: bool):
     return dataset.batch(16).prefetch(tf.data.AUTOTUNE)
 
 
-def find_best_threshold(probabilities: np.ndarray, labels: np.ndarray) -> tuple[float, float]:
+def find_best_threshold(
+    probabilities: np.ndarray, labels: np.ndarray
+) -> tuple[float, float]:
     best_threshold = 0.5
     best_score = -1.0
 
     for threshold in np.linspace(0.1, 0.9, 81):
         predictions = (probabilities >= threshold).astype(int)
         score = balanced_accuracy_score(labels, predictions)
-        if score > best_score or (np.isclose(score, best_score) and threshold > best_threshold):
+        if score > best_score or (
+            np.isclose(score, best_score) and threshold > best_threshold
+        ):
             best_threshold = float(threshold)
             best_score = float(score)
 
@@ -122,19 +121,33 @@ def find_best_threshold(probabilities: np.ndarray, labels: np.ndarray) -> tuple[
 def main():
     tf, keras, _ = import_tf()
 
-    parser = argparse.ArgumentParser(description="Train the MobileNetV2 transfer-learning face classifier")
-    parser.add_argument("--dataset-dir", type=Path, default=DATA_DIR, help=f"Dataset root (default: {DATA_DIR})")
+    parser = argparse.ArgumentParser(
+        description="Train the MobileNetV2 transfer-learning face classifier"
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=DATA_DIR,
+        help=f"Data root with member/ and non_member/ subdirs (default: {DATA_DIR})",
+    )
     parser.add_argument(
         "--model-path",
         type=Path,
         default=DEFAULT_TRANSFER_MODEL_PATH,
         help=f"Where to save the trained model (default: {DEFAULT_TRANSFER_MODEL_PATH})",
     )
-    parser.add_argument("--head-epochs", type=int, default=6, help="Epochs with a frozen backbone")
-    parser.add_argument("--finetune-epochs", type=int, default=6, help="Epochs with the top MobileNetV2 layers unfrozen")
+    parser.add_argument(
+        "--head-epochs", type=int, default=6, help="Epochs with a frozen backbone"
+    )
+    parser.add_argument(
+        "--finetune-epochs",
+        type=int,
+        default=6,
+        help="Epochs with the top MobileNetV2 layers unfrozen",
+    )
     args = parser.parse_args()
 
-    paths, labels = collect_samples(args.dataset_dir)
+    paths, labels = collect_samples(args.data_dir)
     train_paths, temp_paths, train_labels, temp_labels = train_test_split(
         paths,
         labels,
@@ -163,13 +176,27 @@ def main():
 
     args.model_path.parent.mkdir(parents=True, exist_ok=True)
     callbacks = [
-        keras.callbacks.EarlyStopping(monitor="val_loss", patience=3, restore_best_weights=True),
-        keras.callbacks.ModelCheckpoint(args.model_path, monitor="val_loss", save_best_only=True),
-        keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.3, patience=2, min_lr=1e-6),
+        keras.callbacks.EarlyStopping(
+            monitor="val_loss", patience=3, restore_best_weights=True
+        ),
+        keras.callbacks.ModelCheckpoint(
+            args.model_path, monitor="val_loss", save_best_only=True
+        ),
+        keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss", factor=0.3, patience=2, min_lr=1e-6
+        ),
     ]
 
-    print(f"Training on {len(train_paths)} images, validating on {len(val_paths)}, testing on {len(test_paths)}")
-    model.fit(train_ds, validation_data=val_ds, epochs=args.head_epochs, callbacks=callbacks, verbose=1)
+    print(
+        f"Training on {len(train_paths)} images, validating on {len(val_paths)}, testing on {len(test_paths)}"
+    )
+    model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=args.head_epochs,
+        callbacks=callbacks,
+        verbose=1,
+    )
 
     base_model.trainable = True
     for layer in base_model.layers[:-20]:
@@ -180,13 +207,21 @@ def main():
         loss="binary_crossentropy",
         metrics=[keras.metrics.BinaryAccuracy(name="accuracy")],
     )
-    model.fit(train_ds, validation_data=val_ds, epochs=args.finetune_epochs, callbacks=callbacks, verbose=1)
+    model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=args.finetune_epochs,
+        callbacks=callbacks,
+        verbose=1,
+    )
 
     best_model = keras.models.load_model(args.model_path)
     val_probabilities = best_model.predict(val_ds, verbose=0).reshape(-1)
     test_probabilities = best_model.predict(test_ds, verbose=0).reshape(-1)
 
-    threshold, val_balanced_accuracy = find_best_threshold(val_probabilities, val_labels.astype(int))
+    threshold, val_balanced_accuracy = find_best_threshold(
+        val_probabilities, val_labels.astype(int)
+    )
     test_predictions = (test_probabilities >= threshold).astype(int)
 
     metadata = {
@@ -198,7 +233,9 @@ def main():
         "test_count": len(test_paths),
         "val_balanced_accuracy": float(val_balanced_accuracy),
         "test_accuracy": float(accuracy_score(test_labels, test_predictions)),
-        "test_balanced_accuracy": float(balanced_accuracy_score(test_labels, test_predictions)),
+        "test_balanced_accuracy": float(
+            balanced_accuracy_score(test_labels, test_predictions)
+        ),
         "tensorflow_version": tf.__version__,
     }
     save_transfer_metadata(args.model_path, metadata)
