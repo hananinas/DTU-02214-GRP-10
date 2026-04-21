@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 
 import os
+from pathlib import Path
+
+import matplotlib
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from PIL import Image
+from sklearn.metrics import ConfusionMatrixDisplay, confusion_matrix
+from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, TensorDataset
-from datasets import load_dataset
-from huggingface_hub import login
-from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
-import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-REPO_ID = "hananinas/faces2_dataset"
 MODEL_SAVE_DIR = "model"
 IMAGE_SIZE = 64
 EPOCHS = 20
@@ -54,15 +55,15 @@ class FaceClassifier(nn.Module):
     def __init__(self):
         super().__init__()
         self.features = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, padding=1),
+            nn.Conv2d(3, 16, kernel_size=5, padding=2),
             nn.BatchNorm2d(16),
             nn.ReLU(),
             nn.MaxPool2d(2),
-            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.Conv2d(16, 32, kernel_size=5, padding=2),
             nn.BatchNorm2d(32),
             nn.ReLU(),
             nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.Conv2d(32, 64, kernel_size=5, padding=2),
             nn.BatchNorm2d(64),
             nn.ReLU(),
             nn.MaxPool2d(2),
@@ -79,30 +80,45 @@ class FaceClassifier(nn.Module):
         return self.classifier(self.features(x)).squeeze(1)
 
 
-def load_and_prepare_data(token: str):
-    login(token=token, add_to_git_credential=False)
-    ds = load_dataset(REPO_ID)
+def load_and_prepare_data():
+    data_dir = Path(__file__).parent / "data"
+    member_dir = data_dir / "member"
+    non_member_dir = data_dir / "non_member"
 
-    def extract_images_labels(split):
-        images = []
-        labels = []
-        for item in split:
-            img = item["image"]
+    images = []
+    labels = []
+
+    for label_value, source_dir in [(1, member_dir), (0, non_member_dir)]:
+        if not source_dir.exists():
+            print(f"Warning: {source_dir} does not exist, skipping.")
+            continue
+
+        for image_path in sorted(source_dir.iterdir()):
+            if not image_path.is_file():
+                continue
+            if image_path.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
+                continue
+
+            img = Image.open(image_path)
             if img.mode != "RGB":
                 img = img.convert("RGB")
             img = img.resize((IMAGE_SIZE, IMAGE_SIZE))
             arr = np.array(img, dtype=np.float32) / 255.0
             arr = np.transpose(arr, (2, 0, 1))
             images.append(arr)
-            labels.append(int(item["label"]))
-        images = np.array(images)
-        labels = np.array(labels)
-        return images, labels
+            labels.append(label_value)
 
-    print("Loading train split...")
-    x_train, y_train = extract_images_labels(ds["train"])
-    print("Loading test split...")
-    x_test, y_test = extract_images_labels(ds["test"])
+    images = np.array(images)
+    labels = np.array(labels)
+
+    print(f"Total images loaded: {len(images)}")
+    print(
+        f"Member images: {labels.sum()}, Non-member images: {len(labels) - labels.sum()}"
+    )
+
+    x_train, x_test, y_train, y_test = train_test_split(
+        images, labels, test_size=0.2, random_state=42, stratify=labels
+    )
 
     print(f"x_train shape: {x_train.shape}, y_train shape: {y_train.shape}")
     print(f"x_test shape: {x_test.shape}, y_test shape: {y_test.shape}")
@@ -306,13 +322,7 @@ def train_and_evaluate(x_train, y_train, x_test, y_test):
 
 
 def main():
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--token", required=True, help="HF access token")
-    args = parser.parse_args()
-
-    x_train, y_train, x_test, y_test = load_and_prepare_data(args.token)
+    x_train, y_train, x_test, y_test = load_and_prepare_data()
     train_and_evaluate(x_train, y_train, x_test, y_test)
 
 

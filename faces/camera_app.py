@@ -12,6 +12,12 @@ import numpy as np
 from collections import deque
 from PIL import Image
 
+from transfer_model import (
+    DEFAULT_TRANSFER_MODEL_PATH,
+    load_transfer_model,
+    predict_member_probability_from_pil_image,
+)
+
 # Configuration constants
 DEFAULT_PORT = "/dev/ttyACM0"
 BAUD_RATE = 921600
@@ -25,7 +31,12 @@ SIDEBAR_WIDTH = 360
 WINDOW_WIDTH = PREVIEW_WIDTH + SIDEBAR_WIDTH
 WINDOW_HEIGHT = PREVIEW_HEIGHT
 FRAME_PREAMBLE = b"===FRAME===\n"
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "model", "best_model.pth")
+TORCH_MODEL_PATH = os.path.join(os.path.dirname(__file__), "model", "best_model.pth")
+MODEL_PATH = (
+    str(DEFAULT_TRANSFER_MODEL_PATH)
+    if DEFAULT_TRANSFER_MODEL_PATH.exists()
+    else TORCH_MODEL_PATH
+)
 IMAGE_SIZE = 64
 
 
@@ -37,15 +48,15 @@ class FaceClassifier(nn.Module):
     def __init__(self):
         super().__init__()
         self.features = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, padding=1),
+            nn.Conv2d(3, 16, kernel_size=5, padding=2),
             nn.BatchNorm2d(16),
             nn.ReLU(),
             nn.MaxPool2d(2),
-            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.Conv2d(16, 32, kernel_size=5, padding=2),
             nn.BatchNorm2d(32),
             nn.ReLU(),
             nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.Conv2d(32, 64, kernel_size=5, padding=2),
             nn.BatchNorm2d(64),
             nn.ReLU(),
             nn.MaxPool2d(2),
@@ -63,6 +74,10 @@ class FaceClassifier(nn.Module):
 
 
 def load_model(path, device):
+    if path.endswith(".keras"):
+        model, metadata = load_transfer_model(path)
+        return "keras", model, float(metadata.get("threshold", 0.5))
+
     try:
         checkpoint = torch.load(path, map_location=device, weights_only=True)
     except Exception:
@@ -72,7 +87,7 @@ def load_model(path, device):
     model.to(device)
     model.eval()
     threshold = float(checkpoint.get("threshold", 0.5))
-    return model, threshold
+    return "torch", model, threshold
 
 
 def preprocess_for_model(surface: pygame.Surface) -> torch.Tensor:
@@ -85,8 +100,14 @@ def preprocess_for_model(surface: pygame.Surface) -> torch.Tensor:
 
 
 def predict(
-    model, threshold: float, surface: pygame.Surface, device
+    backend, model, threshold: float, surface: pygame.Surface, device
 ) -> tuple[bool, float]:
+    if backend == "keras":
+        rgb_bytes = pygame.image.tobytes(surface, "RGB")
+        image = Image.frombytes("RGB", (WIDTH, HEIGHT), rgb_bytes)
+        probability = predict_member_probability_from_pil_image(image, model)
+        return probability >= threshold, probability
+
     x = preprocess_for_model(surface).to(device)
     with torch.no_grad():
         probability = torch.sigmoid(model(x)).item()
@@ -158,8 +179,9 @@ def main():
     print(f"Using device: {device}")
 
     print(f"Loading model from {args.model}...")
-    model, threshold = load_model(args.model, device)
+    backend, model, threshold = load_model(args.model, device)
     print("Model loaded.")
+    print(f"Using backend: {backend}")
     print(f"Using decision threshold: {threshold:.2f}")
 
     print(f"Opening serial port {args.port}...")
@@ -208,7 +230,9 @@ def main():
             frame_count += 1
             if frame_count % inference_interval == 0:
                 inference_start = time.perf_counter()
-                is_member, confidence = predict(model, threshold, surface, device)
+                is_member, confidence = predict(
+                    backend, model, threshold, surface, device
+                )
                 last_inference_ms = (time.perf_counter() - inference_start) * 1000.0
                 last_result = is_member
                 last_confidence = confidence

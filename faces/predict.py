@@ -1,12 +1,25 @@
 #!/usr/bin/env python3
 
+import os
 import sys
 import torch
 import torch.nn as nn
 import numpy as np
 from PIL import Image
 
-MODEL_PATH = "model/best_model.pth"
+from transfer_model import (
+    DEFAULT_TRANSFER_MODEL_PATH,
+    load_transfer_model,
+    predict_member_probability_from_pil_image,
+)
+
+BASE_DIR = os.path.dirname(__file__)
+TORCH_MODEL_PATH = os.path.join(BASE_DIR, "model", "best_model.pth")
+MODEL_PATH = (
+    str(DEFAULT_TRANSFER_MODEL_PATH)
+    if DEFAULT_TRANSFER_MODEL_PATH.exists()
+    else TORCH_MODEL_PATH
+)
 IMAGE_SIZE = 64
 
 
@@ -18,15 +31,15 @@ class FaceClassifier(nn.Module):
     def __init__(self):
         super().__init__()
         self.features = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, padding=1),
+            nn.Conv2d(3, 16, kernel_size=5, padding=2),
             nn.BatchNorm2d(16),
             nn.ReLU(),
             nn.MaxPool2d(2),
-            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.Conv2d(16, 32, kernel_size=5, padding=2),
             nn.BatchNorm2d(32),
             nn.ReLU(),
             nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.Conv2d(32, 64, kernel_size=5, padding=2),
             nn.BatchNorm2d(64),
             nn.ReLU(),
             nn.MaxPool2d(2),
@@ -44,6 +57,10 @@ class FaceClassifier(nn.Module):
 
 
 def load_model(path, device):
+    if path.endswith(".keras"):
+        model, metadata = load_transfer_model(path)
+        return "keras", model, float(metadata.get("threshold", 0.5))
+
     try:
         checkpoint = torch.load(path, map_location=device, weights_only=True)
     except Exception:
@@ -53,7 +70,7 @@ def load_model(path, device):
     model.to(device)
     model.eval()
     threshold = float(checkpoint.get("threshold", 0.5))
-    return model, threshold
+    return "torch", model, threshold
 
 
 def preprocess_image(image_path):
@@ -66,7 +83,12 @@ def preprocess_image(image_path):
     return torch.tensor(arr[None, ...], dtype=torch.float32)
 
 
-def predict(image_path, model, threshold, device):
+def predict(image_path, backend, model, threshold, device):
+    if backend == "keras":
+        with Image.open(image_path) as image:
+            probability = predict_member_probability_from_pil_image(image, model)
+        return probability >= threshold, probability
+
     x = preprocess_image(image_path).to(device)
     with torch.no_grad():
         probability = torch.sigmoid(model(x)).item()
@@ -81,15 +103,16 @@ def main():
     device = get_device()
     print(f"Using device: {device}")
 
-    model, threshold = load_model(MODEL_PATH, device)
+    backend, model, threshold = load_model(MODEL_PATH, device)
     image_path = sys.argv[1]
 
-    is_member, confidence = predict(image_path, model, threshold, device)
+    is_member, confidence = predict(image_path, backend, model, threshold, device)
     result = (
         "Yes - team member face detected"
         if is_member
         else "No - no team member face detected"
     )
+    print(f"Backend: {backend}")
     print(f"Result: {result}")
     print(f"Confidence: {confidence:.4f}")
     print(f"Threshold: {threshold:.4f}")
