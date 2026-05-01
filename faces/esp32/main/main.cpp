@@ -10,12 +10,10 @@
 
 // Project includes
 #include "camera.h"
+#include "inference.h"
+#include "model.h"
 
 // Static constants and variables
-static constexpr size_t CHUNK_SIZE = 1024;
-static constexpr TickType_t STREAM_WRITE_TIMEOUT = pdMS_TO_TICKS(100);
-static constexpr TickType_t STREAM_RETRY_DELAY = pdMS_TO_TICKS(1);
-static const char* FRAME_PREAMBLE = "\n===FRAME===\n";
 static uint8_t image_buffer[FRAME_W * FRAME_H * FRAME_C];
 
 void setup()
@@ -33,16 +31,20 @@ void setup()
         abort();
     }
 
-    // Initialize USB serial
+    if (!inference_init()) {
+        abort();
+    }
+
+    // Initialize USB serial for logs/control.
     usb_serial_jtag_driver_config_t cfg = {
-        .tx_buffer_size = 4096,
+        .tx_buffer_size = 32768,
         .rx_buffer_size = 512,
     };
     err = usb_serial_jtag_driver_install(&cfg);
     ESP_ERROR_CHECK(err);
 
-    // Wait for incoming S on serial port
-    printf("Send 'S' to start.\n");
+    // Wait for incoming S on serial port so tests can start from a known point.
+    printf("On-device face classifier ready. Send 'S' to start.\n");
     char c;
     do {
         int r = usb_serial_jtag_read_bytes(&c, 1, portMAX_DELAY);
@@ -52,28 +54,46 @@ void setup()
     } while (c != 'S');
 }
 
+// Set to true to stream raw RGB565 frames over serial so the pygame app
+// can display the camera feed alongside on-device inference results.
+static constexpr bool STREAM_FRAMES = true;
+
+static void stream_frame(void)
+{
+    // Preamble the pygame app uses to find frame boundaries.
+    const char *preamble = "===FRAME===\n";
+    usb_serial_jtag_write_bytes(preamble, strlen(preamble), portMAX_DELAY);
+
+    // Send raw RGB565 frame in chunks (USB FS packet size = 64 bytes).
+    constexpr size_t FRAME_BYTES = FRAME_W * FRAME_H * FRAME_C;
+    constexpr size_t CHUNK = 512;
+    for (size_t offset = 0; offset < FRAME_BYTES; offset += CHUNK) {
+        size_t n = (offset + CHUNK <= FRAME_BYTES) ? CHUNK : (FRAME_BYTES - offset);
+        usb_serial_jtag_write_bytes(image_buffer + offset, n, portMAX_DELAY);
+    }
+}
+
 void loop(void)
 {
-    // Capture frame into tensor
     if (camera_capture_frame(image_buffer)) {
-        // Send preamble
-        usb_serial_jtag_write_bytes(FRAME_PREAMBLE, strlen(FRAME_PREAMBLE), STREAM_WRITE_TIMEOUT);
+        float member_probability = 0.0f;
+        if (inference_run_rgb565(image_buffer, &member_probability)) {
+            const bool is_member = member_probability >= MEMBER_THRESHOLD;
 
-        // Send image over USB console
-        // Note that usb_serial_jtag_write_bytes() may fail if writing too many bytes at once, so it's necessary to
-        // send in chunks.
-        size_t frame_size = sizeof(image_buffer);
-        for (size_t offset = 0; offset < frame_size;) {
-            size_t to_write = offset + CHUNK_SIZE < frame_size ? CHUNK_SIZE : frame_size - offset;
-            int written = usb_serial_jtag_write_bytes(image_buffer + offset, to_write, STREAM_WRITE_TIMEOUT);
-            if (written < to_write) {
-                vTaskDelay(STREAM_RETRY_DELAY);
+            if (STREAM_FRAMES) {
+                stream_frame();
             }
-            if (written > 0) {
-                offset += written;
-            }
+
+            printf("member_probability=%.3f threshold=%.3f decision=%s\n",
+                   member_probability,
+                   static_cast<double>(MEMBER_THRESHOLD),
+                   is_member ? "MEMBER" : "NON_MEMBER");
         }
     }
+
+    // When streaming frames the USB transfer provides natural pacing; only
+    // add a small yield so the idle task can run the watchdog.
+    vTaskDelay(pdMS_TO_TICKS(STREAM_FRAMES ? 10 : 100));
 }
 
 // ---------- ESP-IDF entry point ----------

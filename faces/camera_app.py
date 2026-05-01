@@ -13,6 +13,7 @@ from collections import deque
 from PIL import Image
 
 from transfer_model import (
+    configure_tensorflow_device,
     DEFAULT_TRANSFER_MODEL_PATH,
     load_transfer_model,
     predict_member_probability_from_pil_image,
@@ -75,25 +76,58 @@ class FaceClassifier(nn.Module):
 
 def load_model(path, device):
     if path.endswith(".keras"):
+        tensorflow_device = configure_tensorflow_device()
         model, metadata = load_transfer_model(path)
-        return "keras", model, float(metadata.get("threshold", 0.5))
+        return "keras", model, float(metadata.get("threshold", 0.5)), tensorflow_device
 
     try:
         checkpoint = torch.load(path, map_location=device, weights_only=True)
     except Exception:
         checkpoint = torch.load(path, map_location=device, weights_only=False)
+
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+        threshold = float(checkpoint.get("threshold", 0.5))
+    else:
+        state_dict = checkpoint
+        meta_path = os.path.splitext(path)[0] + "_meta.npz"
+        threshold = 0.5
+        if os.path.exists(meta_path):
+            try:
+                meta = np.load(meta_path)
+                threshold = float(meta["threshold"])
+            except Exception:
+                pass
+
     model = FaceClassifier()
-    model.load_state_dict(checkpoint["model_state_dict"])
+    model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
-    threshold = float(checkpoint.get("threshold", 0.5))
-    return "torch", model, threshold
+    return "torch", model, threshold, str(device)
 
 
 def preprocess_for_model(surface: pygame.Surface) -> torch.Tensor:
     rgb_bytes = pygame.image.tobytes(surface, "RGB")
     img = Image.frombytes("RGB", (WIDTH, HEIGHT), rgb_bytes)
-    img = img.resize((IMAGE_SIZE, IMAGE_SIZE))
+
+    # Resize shortest side to target, then center crop (maintains aspect ratio)
+    w, h = img.size
+
+    if w < h:
+        new_w = IMAGE_SIZE
+        new_h = int(h * (IMAGE_SIZE / w))
+    else:
+        new_h = IMAGE_SIZE
+        new_w = int(w * (IMAGE_SIZE / h))
+
+    img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+    # Center crop
+    w, h = img.size
+    left = (w - IMAGE_SIZE) // 2
+    top = (h - IMAGE_SIZE) // 2
+    img = img.crop((left, top, left + IMAGE_SIZE, top + IMAGE_SIZE))
+
     arr = np.array(img, dtype=np.float32) / 255.0
     arr = np.transpose(arr, (2, 0, 1))
     return torch.tensor(arr[None, ...], dtype=torch.float32)
@@ -119,23 +153,18 @@ def capture_frame(serial_port: serial.Serial) -> pygame.Surface | None:
     if not chunk.endswith(FRAME_PREAMBLE):
         return None
 
-    frame_rgb565 = serial_port.read(WIDTH * HEIGHT * 2)
-    if len(frame_rgb565) != WIDTH * HEIGHT * 2:
+    raw = serial_port.read(WIDTH * HEIGHT * 2)
+    if len(raw) != WIDTH * HEIGHT * 2:
         return None
 
-    frame_rgb = bytearray(WIDTH * HEIGHT * 3)
-    for y in range(HEIGHT):
-        for x in range(WIDTH):
-            src_index = (y * WIDTH + x) * 2
-            dst_index = (y * WIDTH + x) * 3
-            byte1 = frame_rgb565[src_index]
-            byte2 = frame_rgb565[src_index + 1]
-            r8 = byte1 & 0xF8
-            g8 = ((byte1 & 0x07) << 5) | ((byte2 & 0xE0) >> 3)
-            b8 = (byte2 & 0x1F) << 3
-            frame_rgb[dst_index] = r8
-            frame_rgb[dst_index + 1] = g8
-            frame_rgb[dst_index + 2] = b8
+    # Vectorised RGB565 -> RGB888 using numpy (replaces a 76 800-iteration Python loop).
+    px = np.frombuffer(raw, dtype=np.uint8).reshape(HEIGHT * WIDTH, 2)
+    b1 = px[:, 0].astype(np.uint16)
+    b2 = px[:, 1].astype(np.uint16)
+    r = (b1 & 0xF8).astype(np.uint8)
+    g = (((b1 & 0x07) << 5) | ((b2 & 0xE0) >> 3)).astype(np.uint8)
+    b = ((b2 & 0x1F) << 3).astype(np.uint8)
+    frame_rgb = np.stack([r, g, b], axis=1).tobytes()
 
     return pygame.image.frombuffer(frame_rgb, (WIDTH, HEIGHT), "RGB")
 
@@ -163,26 +192,57 @@ def draw_progress_bar(screen, rect, value, threshold, fill_color):
     )
 
 
+def read_ondevice_result(serial_port: serial.Serial) -> tuple[bool, float] | None:
+    """Read one inference result line printed by the on-device firmware.
+
+    The firmware prints lines like:
+        member_probability=0.612 threshold=0.570 decision=MEMBER
+    This is called right after capture_frame() consumes the binary frame data.
+    """
+    try:
+        line = serial_port.readline().decode("ascii", errors="ignore").strip()
+        if not line.startswith("member_probability="):
+            return None
+        parts = dict(p.split("=") for p in line.split() if "=" in p)
+        prob = float(parts["member_probability"])
+        is_member = parts.get("decision", "") == "MEMBER"
+        return is_member, prob
+    except Exception:
+        return None
+
+
 def main():
     parser = argparse.ArgumentParser(description="Face classifier with ESP32-S3 camera")
     parser.add_argument(
         "--port", default=DEFAULT_PORT, help=f"Serial port (default: {DEFAULT_PORT})"
     )
     parser.add_argument("--model", default=MODEL_PATH, help="Path to trained model")
+    parser.add_argument(
+        "--on-device",
+        action="store_true",
+        help="Use on-device inference results from ESP32 instead of running a local model",
+    )
     args = parser.parse_args()
 
-    if not os.path.exists(args.model):
-        print(f"Model not found at {args.model}. Run train.py first.", file=sys.stderr)
-        sys.exit(1)
+    if args.on_device:
+        backend = "on-device"
+        model = None
+        threshold = None
+        runtime_device = "ESP32-S3"
+        device = None
+        print("On-device mode: inference results will be read from the ESP32.")
+    else:
+        if not os.path.exists(args.model):
+            print(f"Model not found at {args.model}. Run train.py first.", file=sys.stderr)
+            sys.exit(1)
 
-    device = get_device()
-    print(f"Using device: {device}")
-
-    print(f"Loading model from {args.model}...")
-    backend, model, threshold = load_model(args.model, device)
-    print("Model loaded.")
-    print(f"Using backend: {backend}")
-    print(f"Using decision threshold: {threshold:.2f}")
+        device = get_device()
+        print(f"Loading model from {args.model}...")
+        backend, model, threshold, runtime_device = load_model(args.model, device)
+        print("Model loaded.")
+        print(f"Using backend: {backend}")
+        print(f"Using device: {runtime_device}")
+        print(f"Using decision threshold: {threshold:.2f}")
 
     print(f"Opening serial port {args.port}...")
     try:
@@ -228,7 +288,16 @@ def main():
                 continue
 
             frame_count += 1
-            if frame_count % inference_interval == 0:
+            if args.on_device:
+                # Result arrives as a text line immediately after the frame bytes.
+                result = read_ondevice_result(serial_port)
+                if result is not None:
+                    last_result, last_confidence = result
+                    prediction_history.appendleft(
+                        ("M" if last_result else "N", last_confidence)
+                    )
+                    last_inference_ms = None
+            elif frame_count % inference_interval == 0:
                 inference_start = time.perf_counter()
                 is_member, confidence = predict(
                     backend, model, threshold, surface, device
@@ -301,30 +370,32 @@ def main():
                     sidebar_x + 24,
                     236,
                 )
+                if threshold is not None:
+                    draw_text(
+                        screen,
+                        body_font,
+                        f"Threshold: {threshold:.2%}",
+                        (232, 232, 236),
+                        sidebar_x + 24,
+                        266,
+                    )
                 draw_text(
                     screen,
                     body_font,
-                    f"Threshold: {threshold:.2%}",
-                    (232, 232, 236),
-                    sidebar_x + 24,
-                    266,
-                )
-                draw_text(
-                    screen,
-                    body_font,
-                    f"Device: {device}",
+                    f"Device: {runtime_device}",
                     (232, 232, 236),
                     sidebar_x + 24,
                     296,
                 )
-                draw_text(
-                    screen,
-                    body_font,
-                    f"Inference every {inference_interval} frames",
-                    (232, 232, 236),
-                    sidebar_x + 24,
-                    326,
-                )
+                if not args.on_device:
+                    draw_text(
+                        screen,
+                        body_font,
+                        f"Inference every {inference_interval} frames",
+                        (232, 232, 236),
+                        sidebar_x + 24,
+                        326,
+                    )
                 if last_inference_ms is not None:
                     draw_text(
                         screen,
@@ -404,7 +475,8 @@ def main():
                 draw_text(
                     screen,
                     body_font,
-                    "Receiving frames from ESP32...",
+                    "Receiving frames from ESP32..." if not args.on_device
+                    else "Waiting for on-device result...",
                     (232, 232, 236),
                     sidebar_x + 24,
                     206,

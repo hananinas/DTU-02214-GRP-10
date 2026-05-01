@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 
 from pathlib import Path
+
 from datasets import Dataset, DatasetDict, Image
-from huggingface_hub import HfApi, login
 
 DATA_DIR = Path(__file__).parent / "data"
 CLASSIFIED_DIR = DATA_DIR / "classified_faces"
 MEMBER_DIR = CLASSIFIED_DIR / "member"
 NON_MEMBER_DIR = CLASSIFIED_DIR / "non_member"
 LABELS_FILE = CLASSIFIED_DIR / "labels.txt"
+DATASET_DIR = DATA_DIR / "prepared_dataset"
 
 
 def generate_labels_file() -> list[dict[str, object]]:
@@ -61,28 +62,7 @@ def build_dataset() -> DatasetDict:
     return DatasetDict({"train": split["train"], "test": split["test"]})
 
 
-def upload_to_hf(dataset: DatasetDict, repo_id: str, token: str):
-    login(token=token)
-    api = HfApi()
-    api.create_repo(repo_id=repo_id, repo_type="dataset", exist_ok=True)
-    dataset.push_to_hub(repo_id)
-    api.upload_file(
-        path_or_fileobj=str(LABELS_FILE),
-        path_in_repo="labels.txt",
-        repo_id=repo_id,
-        repo_type="dataset",
-    )
-    print(f"Dataset uploaded to https://huggingface.co/datasets/{repo_id}")
-
-
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--repo-id", required=True, help="HF dataset repo ID")
-    parser.add_argument("--token", required=True, help="HF access token")
-    args = parser.parse_args()
-
     dataset = build_dataset()
     print(f"Train: {len(dataset['train'])} images")
     print(f"Test: {len(dataset['test'])} images")
@@ -93,4 +73,5 @@ if __name__ == "__main__":
         f"Member ratio (test): {sum(dataset['test']['label']) / len(dataset['test']):.2f}"
     )
 
-    upload_to_hf(dataset, args.repo_id, args.token)
+    dataset.save_to_disk(str(DATASET_DIR))
+    print(f"Dataset saved to {DATASET_DIR}")

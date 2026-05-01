@@ -8,6 +8,7 @@ import numpy as np
 from PIL import Image
 
 from transfer_model import (
+    configure_tensorflow_device,
     DEFAULT_TRANSFER_MODEL_PATH,
     load_transfer_model,
     predict_member_probability_from_pil_image,
@@ -58,19 +59,34 @@ class FaceClassifier(nn.Module):
 
 def load_model(path, device):
     if path.endswith(".keras"):
+        tensorflow_device = configure_tensorflow_device()
         model, metadata = load_transfer_model(path)
-        return "keras", model, float(metadata.get("threshold", 0.5))
+        return "keras", model, float(metadata.get("threshold", 0.5)), tensorflow_device
 
     try:
         checkpoint = torch.load(path, map_location=device, weights_only=True)
     except Exception:
         checkpoint = torch.load(path, map_location=device, weights_only=False)
+
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+        threshold = float(checkpoint.get("threshold", 0.5))
+    else:
+        state_dict = checkpoint
+        meta_path = os.path.splitext(path)[0] + "_meta.npz"
+        threshold = 0.5
+        if os.path.exists(meta_path):
+            try:
+                meta = np.load(meta_path)
+                threshold = float(meta["threshold"])
+            except Exception:
+                pass
+
     model = FaceClassifier()
-    model.load_state_dict(checkpoint["model_state_dict"])
+    model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
-    threshold = float(checkpoint.get("threshold", 0.5))
-    return "torch", model, threshold
+    return "torch", model, threshold, str(device)
 
 
 def preprocess_image(image_path):
@@ -101,9 +117,8 @@ def main():
         sys.exit(1)
 
     device = get_device()
-    print(f"Using device: {device}")
-
-    backend, model, threshold = load_model(MODEL_PATH, device)
+    backend, model, threshold, runtime_device = load_model(MODEL_PATH, device)
+    print(f"Using device: {runtime_device}")
     image_path = sys.argv[1]
 
     is_member, confidence = predict(image_path, backend, model, threshold, device)

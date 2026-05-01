@@ -10,10 +10,7 @@ from PIL import Image
 from download_faces import DATA_DIR, crop_faces
 
 
-SOURCE_MEMBER_DIR = Path(DATA_DIR) / "face2_dataset"
-OUTPUT_ROOT = Path(DATA_DIR) / "classified_faces"
-MEMBER_DIR = OUTPUT_ROOT / "member"
-NON_MEMBER_DIR = OUTPUT_ROOT / "non_member"
+NON_MEMBER_DIR = Path(DATA_DIR) / "non_member"
 COCO_FACES_DIR = Path(DATA_DIR) / "faces"
 
 
@@ -30,16 +27,12 @@ def reset_directory(path: Path):
             shutil.rmtree(child)
 
 
-def build_member_dir(source_dir: Path, member_dir: Path):
-    copied = 0
-    for image_path in sorted(source_dir.iterdir()):
-        if not image_path.is_file() or not is_image_file(image_path):
-            continue
-
-        shutil.copy2(image_path, member_dir / image_path.name)
-        copied += 1
-
-    print(f"Copied {copied} member images to {member_dir}")
+def count_images(path: Path) -> int:
+    if not path.exists():
+        return 0
+    return sum(
+        1 for child in path.iterdir() if child.is_file() and is_image_file(child)
+    )
 
 
 def is_large_enough_face(image_path: Path, min_size: int) -> bool:
@@ -51,30 +44,46 @@ def is_large_enough_face(image_path: Path, min_size: int) -> bool:
 def build_non_member_dir(
     source_dir: Path, non_member_dir: Path, limit: int, min_size: int
 ):
+    existing_count = count_images(non_member_dir)
+    if existing_count >= limit:
+        print(
+            f"Non-member directory already has {existing_count} images; target is {limit}"
+        )
+        return
+
     copied = 0
+    next_index = existing_count
     for image_path in sorted(source_dir.iterdir()):
-        if copied >= limit:
+        if existing_count + copied >= limit:
             break
         if not image_path.is_file() or not is_image_file(image_path):
             continue
         if not is_large_enough_face(image_path, min_size):
             continue
 
-        target_name = f"coco_{copied:05d}{image_path.suffix.lower()}"
-        shutil.copy2(image_path, non_member_dir / target_name)
-        copied += 1
+        target_name = f"coco_{next_index:05d}{image_path.suffix.lower()}"
+        target_path = non_member_dir / target_name
+        if target_path.exists():
+            next_index += 1
+            continue
 
-    print(f"Copied {copied} non-member images to {non_member_dir}")
+        shutil.copy2(image_path, target_path)
+        copied += 1
+        next_index += 1
+
+    print(
+        f"Copied {copied} non-member images to {non_member_dir} (total: {existing_count + copied})"
+    )
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Build member/non_member face directories from local faces and COCO face crops"
+        description="Top up data/non_member from COCO face crops"
     )
     parser.add_argument(
         "--non-member-count",
         type=int,
-        default=500,
+        default=1000,
         help="Maximum number of COCO face crops to place in non_member",
     )
     parser.add_argument(
@@ -85,16 +94,10 @@ def main():
     )
     args = parser.parse_args()
 
-    if not SOURCE_MEMBER_DIR.exists():
-        raise FileNotFoundError(f"Missing source member dataset: {SOURCE_MEMBER_DIR}")
+    NON_MEMBER_DIR.mkdir(parents=True, exist_ok=True)
 
-    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-    reset_directory(MEMBER_DIR)
-    reset_directory(NON_MEMBER_DIR)
-
-    build_member_dir(SOURCE_MEMBER_DIR, MEMBER_DIR)
-
-    crop_faces(num_faces=args.non_member_count * 3)
+    missing_non_members = max(args.non_member_count - count_images(NON_MEMBER_DIR), 0)
+    crop_faces(num_faces=max(missing_non_members * 3, 1))
     if not COCO_FACES_DIR.exists():
         raise FileNotFoundError(f"Missing COCO face crops: {COCO_FACES_DIR}")
 
@@ -105,7 +108,7 @@ def main():
         min_size=args.min_face_size,
     )
 
-    print(f"Built dataset under {OUTPUT_ROOT}")
+    print(f"Updated non-member dataset under {NON_MEMBER_DIR}")
 
 
 if __name__ == "__main__":

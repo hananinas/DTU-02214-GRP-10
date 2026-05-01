@@ -1,329 +1,366 @@
 #!/usr/bin/env python3
 
+import argparse
 import os
+from collections.abc import Sequence
 from pathlib import Path
 
-import matplotlib
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
 from PIL import Image
-from sklearn.metrics import ConfusionMatrixDisplay, confusion_matrix
+from sklearn.metrics import (accuracy_score, balanced_accuracy_score,
+                             confusion_matrix, f1_score, precision_score,
+                             recall_score)
 from sklearn.model_selection import train_test_split
-from torch.utils.data import DataLoader, TensorDataset
 
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+from transfer_model import (DEFAULT_TRANSFER_MODEL_PATH, IMG_SIZE,
+                            POSITIVE_CLASS_NAME, build_transfer_model,
+                            configure_tensorflow_device,
+                            ensure_tensorflow_runtime_environment,
+                            save_transfer_metadata)
 
-MODEL_SAVE_DIR = "model"
-IMAGE_SIZE = 64
-EPOCHS = 20
-BATCH_SIZE = 32
-LEARNING_RATE = 1e-3
-WEIGHT_DECAY = 1e-4
+DATA_DIR = Path(__file__).parent / "data"
+BATCH_SIZE = 16
 
 
-def sigmoid_numpy(x):
-    return 1.0 / (1.0 + np.exp(-x))
+def collect_samples(data_dir: Path) -> tuple[list[str], np.ndarray]:
+    if not data_dir.exists():
+        raise FileNotFoundError(f"Missing data directory: {data_dir}")
 
-
-def find_best_threshold(probs, labels):
-    best_threshold = 0.5
-    best_score = -1.0
-    best_cm = None
-
-    for threshold in np.linspace(0.1, 0.9, 81):
-        preds = (probs >= threshold).astype(int)
-        cm = confusion_matrix(labels, preds, labels=[0, 1])
-        tn, fp, fn, tp = cm.ravel()
-        tpr = tp / (tp + fn) if (tp + fn) else 0.0
-        tnr = tn / (tn + fp) if (tn + fp) else 0.0
-        balanced_acc = 0.5 * (tpr + tnr)
-
-        if balanced_acc > best_score or (
-            np.isclose(balanced_acc, best_score) and threshold > best_threshold
-        ):
-            best_score = balanced_acc
-            best_threshold = float(threshold)
-            best_cm = cm
-
-    return best_threshold, best_score, best_cm
-
-
-class FaceClassifier(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=5, padding=2),
-            nn.BatchNorm2d(16),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(16, 32, kernel_size=5, padding=2),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, kernel_size=5, padding=2),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-        )
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(64 * 8 * 8, 128),
-            nn.ReLU(),
-            nn.Dropout(0.4),
-            nn.Linear(128, 1),
-        )
-
-    def forward(self, x):
-        return self.classifier(self.features(x)).squeeze(1)
-
-
-def load_and_prepare_data():
-    data_dir = Path(__file__).parent / "data"
     member_dir = data_dir / "member"
     non_member_dir = data_dir / "non_member"
 
-    images = []
-    labels = []
+    if not member_dir.exists():
+        raise FileNotFoundError(f"Missing member directory: {member_dir}")
+    if not non_member_dir.exists():
+        raise FileNotFoundError(f"Missing non_member directory: {non_member_dir}")
 
-    for label_value, source_dir in [(1, member_dir), (0, non_member_dir)]:
-        if not source_dir.exists():
-            print(f"Warning: {source_dir} does not exist, skipping.")
-            continue
+    paths: list[str] = []
+    labels: list[int] = []
 
-        for image_path in sorted(source_dir.iterdir()):
-            if not image_path.is_file():
-                continue
-            if image_path.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
-                continue
+    for image_path in sorted(member_dir.iterdir()):
+        if image_path.is_file() and image_path.suffix.lower() in {
+            ".jpg",
+            ".jpeg",
+            ".png",
+        }:
+            paths.append(str(image_path))
+            labels.append(1)
 
-            img = Image.open(image_path)
-            if img.mode != "RGB":
-                img = img.convert("RGB")
-            img = img.resize((IMAGE_SIZE, IMAGE_SIZE))
-            arr = np.array(img, dtype=np.float32) / 255.0
-            arr = np.transpose(arr, (2, 0, 1))
-            images.append(arr)
-            labels.append(label_value)
+    for image_path in sorted(non_member_dir.iterdir()):
+        if image_path.is_file() and image_path.suffix.lower() in {
+            ".jpg",
+            ".jpeg",
+            ".png",
+        }:
+            paths.append(str(image_path))
+            labels.append(0)
 
-    images = np.array(images)
-    labels = np.array(labels)
+    if len(paths) < 10:
+        raise ValueError(f"Not enough images found under {data_dir}")
 
-    print(f"Total images loaded: {len(images)}")
-    print(
-        f"Member images: {labels.sum()}, Non-member images: {len(labels) - labels.sum()}"
+    return paths, np.asarray(labels, dtype=np.float32)
+
+
+def import_tf():
+    ensure_tensorflow_runtime_environment()
+    import tensorflow as tf
+    from tensorflow import keras
+    from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
+
+    return tf, keras, preprocess_input
+
+
+def load_image_array(image_path: str | bytes) -> np.ndarray:
+    if isinstance(image_path, bytes):
+        image_path = image_path.decode("utf-8")
+
+    with Image.open(image_path) as image:
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+
+        # Resize shortest side to target, then center crop (maintains aspect ratio)
+        w, h = image.size
+        target_w, target_h = IMG_SIZE
+
+        if w < h:
+            new_w = target_w
+            new_h = int(h * (target_w / w))
+        else:
+            new_h = target_h
+            new_w = int(w * (target_h / h))
+
+        image = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+        # Center crop
+        w, h = image.size
+        left = (w - target_w) // 2
+        top = (h - target_h) // 2
+        image = image.crop((left, top, left + target_w, top + target_h))
+
+        return np.asarray(image, dtype=np.float32)
+
+
+def make_dataset(
+    paths: Sequence[str],
+    labels: np.ndarray,
+    training: bool,
+    seed: int,
+    augment: bool = False,
+):
+    tf, _, preprocess_input = import_tf()
+
+    def load_and_preprocess(image_path, label):
+        image = tf.numpy_function(load_image_array, [image_path], tf.float32)
+        image.set_shape((*IMG_SIZE, 3))
+        return preprocess_input(image), label
+
+    def augment_image(image, label):
+        # Light augmentation: horizontal flip only
+        image = tf.image.random_flip_left_right(image, seed=seed)
+        return image, label
+
+    dataset = tf.data.Dataset.from_tensor_slices(
+        (list(paths), labels.astype(np.float32))
     )
 
-    x_train, x_test, y_train, y_test = train_test_split(
-        images, labels, test_size=0.2, random_state=42, stratify=labels
+    if training:
+        dataset = dataset.shuffle(len(paths), seed=seed, reshuffle_each_iteration=True)
+
+    dataset = dataset.map(
+        load_and_preprocess,
+        num_parallel_calls=tf.data.AUTOTUNE,
     )
 
-    print(f"x_train shape: {x_train.shape}, y_train shape: {y_train.shape}")
-    print(f"x_test shape: {x_test.shape}, y_test shape: {y_test.shape}")
-    print(f"Train member ratio: {y_train.mean():.2f}")
-    print(f"Test member ratio: {y_test.mean():.2f}")
+    if training and augment:
+        dataset = dataset.map(augment_image, num_parallel_calls=tf.data.AUTOTUNE)
 
-    return x_train, y_train, x_test, y_test
+    return dataset.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
 
 
-def train_and_evaluate(x_train, y_train, x_test, y_test):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+def configure_reproducibility(seed: int):
+    os.environ["PYTHONHASHSEED"] = str(seed)
 
-    model = FaceClassifier().to(device)
-    print(f"\nModel architecture:")
-    print(model)
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Total parameters: {total_params:,}")
-
-    x_train_t = torch.tensor(x_train, dtype=torch.float32)
-    y_train_t = torch.tensor(y_train, dtype=torch.float32)
-    x_test_t = torch.tensor(x_test, dtype=torch.float32)
-    y_test_t = torch.tensor(y_test, dtype=torch.float32)
-
-    train_dataset = TensorDataset(x_train_t, y_train_t)
-    test_dataset = TensorDataset(x_test_t, y_test_t)
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
-
-    positive_count = float(y_train.sum())
-    negative_count = float(len(y_train) - positive_count)
-
-    if positive_count and positive_count < negative_count:
-        pos_weight = torch.tensor(
-            [negative_count / positive_count],
-            dtype=torch.float32,
-            device=device,
-        )
-        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-        print(f"Using positive class weighting: {pos_weight.item():.4f}")
-    else:
-        criterion = nn.BCEWithLogitsLoss()
-        print("Using unweighted loss.")
-    optimizer = optim.Adam(
-        model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
-    )
-
-    os.makedirs(MODEL_SAVE_DIR, exist_ok=True)
-
-    best_val_score = 0.0
-    best_threshold = 0.5
-    train_acc_history = []
-    val_acc_history = []
-    train_loss_history = []
-    val_loss_history = []
-
-    for epoch in range(EPOCHS):
-        model.train()
-        train_loss = 0.0
-        train_correct = 0
-        train_total = 0
-
-        for batch_x, batch_y in train_loader:
-            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
-            optimizer.zero_grad()
-            outputs = model(batch_x)
-            loss = criterion(outputs, batch_y)
-            loss.backward()
-            optimizer.step()
-
-            train_loss += loss.item() * batch_x.size(0)
-            probs = torch.sigmoid(outputs)
-            preds = (probs >= 0.5).float()
-            train_correct += (preds == batch_y).sum().item()
-            train_total += batch_x.size(0)
-
-        avg_train_loss = train_loss / train_total
-        train_acc = train_correct / train_total
-
-        model.eval()
-        val_loss = 0.0
-        val_correct = 0
-        val_total = 0
-        val_logits = []
-        val_labels = []
-        with torch.no_grad():
-            for batch_x, batch_y in test_loader:
-                batch_x, batch_y = batch_x.to(device), batch_y.to(device)
-                outputs = model(batch_x)
-                loss = criterion(outputs, batch_y)
-                val_loss += loss.item() * batch_x.size(0)
-                probs = torch.sigmoid(outputs)
-                preds = (probs >= 0.5).float()
-                val_correct += (preds == batch_y).sum().item()
-                val_total += batch_x.size(0)
-                val_logits.append(outputs.cpu().numpy())
-                val_labels.append(batch_y.cpu().numpy())
-
-        avg_val_loss = val_loss / val_total
-        val_acc = val_correct / val_total
-        val_probs = sigmoid_numpy(np.concatenate(val_logits))
-        val_targets = np.concatenate(val_labels).astype(int)
-        epoch_threshold, val_score, _ = find_best_threshold(val_probs, val_targets)
-
-        train_acc_history.append(train_acc)
-        val_acc_history.append(val_acc)
-        train_loss_history.append(avg_train_loss)
-        val_loss_history.append(avg_val_loss)
-
-        print(
-            f"Epoch {epoch + 1}/{EPOCHS} - Loss: {avg_train_loss:.4f} - "
-            f"Train Acc: {train_acc:.4f} - Val Acc: {val_acc:.4f} - "
-            f"Val Balanced Acc: {val_score:.4f} @ threshold {epoch_threshold:.2f}"
-        )
-
-        if val_score >= best_val_score:
-            best_val_score = val_score
-            best_threshold = epoch_threshold
-            torch.save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "image_size": int(IMAGE_SIZE),
-                    "epoch": int(epoch),
-                    "val_acc": float(val_acc),
-                    "val_balanced_acc": float(val_score),
-                    "threshold": float(best_threshold),
-                },
-                os.path.join(MODEL_SAVE_DIR, "best_model.pth"),
-            )
-            print(
-                f"  -> Saved best model (val_balanced_acc: {val_score:.4f}, threshold: {best_threshold:.2f})"
-            )
+    tf, keras, _ = import_tf()
+    keras.utils.set_random_seed(seed)
 
     try:
-        best_checkpoint = torch.load(
-            os.path.join(MODEL_SAVE_DIR, "best_model.pth"),
-            map_location=device,
-            weights_only=True,
-        )
-    except Exception:
-        best_checkpoint = torch.load(
-            os.path.join(MODEL_SAVE_DIR, "best_model.pth"),
-            map_location=device,
-            weights_only=False,
-        )
-    model.load_state_dict(best_checkpoint["model_state_dict"])
-    best_threshold = float(best_checkpoint.get("threshold", best_threshold))
+        tf.config.experimental.enable_op_determinism()
+    except (AttributeError, RuntimeError):
+        pass
 
-    print(f"\nBest validation balanced accuracy: {best_val_score:.4f}")
-    print(f"Best decision threshold: {best_threshold:.2f}")
+    return tf, keras
 
-    model.eval()
-    all_preds = []
-    all_labels = []
-    with torch.no_grad():
-        for batch_x, batch_y in test_loader:
-            batch_x = batch_x.to(device)
-            outputs = model(batch_x)
-            probs = torch.sigmoid(outputs).cpu().numpy()
-            preds = (probs >= best_threshold).astype(int)
-            all_preds.extend(preds)
-            all_labels.extend(batch_y.numpy())
 
-    all_preds = np.array(all_preds)
-    all_labels = np.array(all_labels)
+def find_best_threshold(
+    probabilities: np.ndarray, labels: np.ndarray
+) -> tuple[float, float]:
+    best_threshold = 0.5
+    best_score = -1.0
 
-    cm = confusion_matrix(all_labels, all_preds, labels=[0, 1])
-    print(f"\nConfusion Matrix:")
-    print(f"              Predicted")
-    print(f"              Non-member  Member")
-    print(f"Actual Non-mem   {cm[0][0]:>3}        {cm[0][1]:>3}")
-    print(f"Actual Member    {cm[1][0]:>3}        {cm[1][1]:>3}")
+    for threshold in np.linspace(0.1, 0.9, 81):
+        predictions = (probabilities >= threshold).astype(int)
+        score = balanced_accuracy_score(labels, predictions)
+        if score > best_score or (
+            np.isclose(score, best_score) and threshold > best_threshold
+        ):
+            best_threshold = float(threshold)
+            best_score = float(score)
 
-    fig, ax = plt.subplots(figsize=(6, 5))
-    disp = ConfusionMatrixDisplay(
-        confusion_matrix=cm, display_labels=["non-member", "member"]
-    )
-    disp.plot(ax=ax, cmap="Blues")
-    ax.set_title("Confusion Matrix")
-    plt.savefig(os.path.join(MODEL_SAVE_DIR, "confusion_matrix.png"), dpi=150)
-    print(f"Confusion matrix saved to {MODEL_SAVE_DIR}/confusion_matrix.png")
+    return best_threshold, best_score
 
-    plt.figure(figsize=(10, 4))
-    plt.subplot(1, 2, 1)
-    plt.plot(train_acc_history, label="Train Accuracy")
-    plt.plot(val_acc_history, label="Val Accuracy")
-    plt.xlabel("Epoch")
-    plt.ylabel("Accuracy")
-    plt.legend()
-    plt.subplot(1, 2, 2)
-    plt.plot(train_loss_history, label="Train Loss")
-    plt.plot(val_loss_history, label="Val Loss")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(MODEL_SAVE_DIR, "training_history.png"), dpi=150)
-    print(f"Training history saved to {MODEL_SAVE_DIR}/training_history.png")
 
-    return model
+def compute_class_weights(labels: np.ndarray) -> dict[int, float]:
+    positive_count = float(labels.sum())
+    negative_count = float(len(labels) - positive_count)
+    total_count = positive_count + negative_count
+
+    return {
+        0: total_count / (2.0 * negative_count),
+        1: total_count / (2.0 * positive_count),
+    }
 
 
 def main():
-    x_train, y_train, x_test, y_test = load_and_prepare_data()
-    train_and_evaluate(x_train, y_train, x_test, y_test)
+    parser = argparse.ArgumentParser(
+        description="Train the MobileNetV2 transfer-learning face classifier"
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=DATA_DIR,
+        help=f"Data root with member/ and non_member/ subdirs (default: {DATA_DIR})",
+    )
+    parser.add_argument(
+        "--model-path",
+        type=Path,
+        default=DEFAULT_TRANSFER_MODEL_PATH,
+        help=f"Where to save the trained model (default: {DEFAULT_TRANSFER_MODEL_PATH})",
+    )
+    parser.add_argument(
+        "--head-epochs",
+        type=int,
+        default=2,
+        help="Epochs with a frozen backbone (default: 2 - optimized for convergence)",
+    )
+    parser.add_argument(
+        "--finetune-epochs",
+        type=int,
+        default=2,
+        help="Epochs with the top MobileNetV2 layers unfrozen (default: 2 - optimal for this dataset)",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42, help="Random seed for deterministic runs"
+    )
+    parser.add_argument(
+        "--no-class-weights",
+        action="store_true",
+        help="Disable class weighting (class weights are ON by default to handle imbalance)",
+    )
+    parser.add_argument(
+        "--no-augment",
+        action="store_true",
+        help="Disable data augmentation (augmentation is ON by default for better generalization)",
+    )
+    args = parser.parse_args()
+
+    tf, keras = configure_reproducibility(args.seed)
+    tensorflow_device = configure_tensorflow_device()
+
+    print(f"Using TensorFlow device(s): {tensorflow_device}")
+
+    paths, labels = collect_samples(args.data_dir)
+    train_paths, temp_paths, train_labels, temp_labels = train_test_split(
+        paths,
+        labels,
+        test_size=0.2,
+        random_state=42,
+        stratify=labels,
+    )
+    val_paths, test_paths, val_labels, test_labels = train_test_split(
+        temp_paths,
+        temp_labels,
+        test_size=0.5,
+        random_state=42,
+        stratify=temp_labels,
+    )
+
+    # Default: augmentation and class weights are ON (best configuration)
+    use_augment = not args.no_augment
+    use_class_weights = not args.no_class_weights
+
+    train_ds = make_dataset(
+        train_paths, train_labels, training=True, seed=args.seed, augment=use_augment
+    )
+    val_ds = make_dataset(val_paths, val_labels, training=False, seed=args.seed)
+    test_ds = make_dataset(test_paths, test_labels, training=False, seed=args.seed)
+    class_weight = compute_class_weights(train_labels) if use_class_weights else None
+
+    model, base_model = build_transfer_model(dropout_rate=0.5)
+    model.compile(
+        optimizer=keras.optimizers.AdamW(learning_rate=1e-3, weight_decay=1e-4),
+        loss=keras.losses.BinaryCrossentropy(label_smoothing=0.1),
+        metrics=[keras.metrics.BinaryAccuracy(name="accuracy")],
+    )
+
+    args.model_path.parent.mkdir(parents=True, exist_ok=True)
+    callbacks = [
+        keras.callbacks.EarlyStopping(
+            monitor="val_loss", patience=3, restore_best_weights=True
+        ),
+        keras.callbacks.ModelCheckpoint(
+            args.model_path, monitor="val_loss", save_best_only=True
+        ),
+        keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss", factor=0.3, patience=2, min_lr=1e-6
+        ),
+    ]
+
+    print(
+        f"Training on {len(train_paths)} images, validating on {len(val_paths)}, testing on {len(test_paths)}"
+    )
+    model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=args.head_epochs,
+        callbacks=callbacks,
+        class_weight=class_weight,
+        verbose=1,
+    )
+
+    base_model.trainable = True
+    for layer in base_model.layers[:-20]:
+        layer.trainable = False
+
+    model.compile(
+        optimizer=keras.optimizers.AdamW(learning_rate=1e-5, weight_decay=1e-5),
+        loss=keras.losses.BinaryCrossentropy(label_smoothing=0.1),
+        metrics=[keras.metrics.BinaryAccuracy(name="accuracy")],
+    )
+    model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=args.finetune_epochs,
+        callbacks=callbacks,
+        class_weight=class_weight,
+        verbose=1,
+    )
+
+    best_model = keras.models.load_model(args.model_path)
+    val_probabilities = best_model.predict(val_ds, verbose=0).reshape(-1)
+    test_probabilities = best_model.predict(test_ds, verbose=0).reshape(-1)
+
+    threshold, val_balanced_accuracy = find_best_threshold(
+        val_probabilities, val_labels.astype(int)
+    )
+    test_predictions = (test_probabilities >= threshold).astype(int)
+    test_labels_int = test_labels.astype(int)
+    tn, fp, fn, tp = confusion_matrix(
+        test_labels_int, test_predictions, labels=[0, 1]
+    ).ravel()
+
+    metadata = {
+        "architecture": "MobileNetV2",
+        "image_size": list(IMG_SIZE),
+        "positive_class": POSITIVE_CLASS_NAME,
+        "threshold": threshold,
+        "train_count": len(train_paths),
+        "val_count": len(val_paths),
+        "test_count": len(test_paths),
+        "val_balanced_accuracy": float(val_balanced_accuracy),
+        "test_accuracy": float(accuracy_score(test_labels_int, test_predictions)),
+        "test_balanced_accuracy": float(
+            balanced_accuracy_score(test_labels_int, test_predictions)
+        ),
+        "test_precision_member": float(
+            precision_score(test_labels_int, test_predictions, zero_division=0)
+        ),
+        "test_recall_member": float(
+            recall_score(test_labels_int, test_predictions, zero_division=0)
+        ),
+        "test_f1_member": float(
+            f1_score(test_labels_int, test_predictions, zero_division=0)
+        ),
+        "confusion_matrix": {
+            "true_non_member_pred_non_member": int(tn),
+            "true_non_member_pred_member": int(fp),
+            "true_member_pred_non_member": int(fn),
+            "true_member_pred_member": int(tp),
+        },
+        "seed": args.seed,
+        "use_class_weights": use_class_weights,
+        "augment": use_augment,
+        "head_epochs": args.head_epochs,
+        "finetune_epochs": args.finetune_epochs,
+        "tensorflow_version": tf.__version__,
+    }
+    save_transfer_metadata(args.model_path, metadata)
+
+    print(f"Saved model to {args.model_path}")
+    print(f"Saved metadata to {args.model_path.with_suffix('.json')}")
+    print(f"Best validation threshold: {threshold:.2f}")
+    print(f"Validation balanced accuracy: {val_balanced_accuracy:.4f}")
+    print(f"Test accuracy: {metadata['test_accuracy']:.4f}")
+    print(f"Test balanced accuracy: {metadata['test_balanced_accuracy']:.4f}")
 
 
 if __name__ == "__main__":
