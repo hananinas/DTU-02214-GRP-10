@@ -7,7 +7,6 @@ build
 data
 gen
 managed_components
-models
 temp
 dependencies.lock
 sdkconfig
