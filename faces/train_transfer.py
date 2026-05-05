@@ -87,25 +87,8 @@ def load_image_array(image_path: str | bytes) -> np.ndarray:
         if image.mode != "RGB":
             image = image.convert("RGB")
 
-        # Resize shortest side to target, then center crop (maintains aspect ratio)
-        w, h = image.size
-        target_w, target_h = IMG_SIZE
-
-        if w < h:
-            new_w = target_w
-            new_h = int(h * (target_w / w))
-        else:
-            new_h = target_h
-            new_w = int(w * (target_h / h))
-
-        image = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
-
-        # Center crop
-        w, h = image.size
-        left = (w - target_w) // 2
-        top = (h - target_h) // 2
-        image = image.crop((left, top, left + target_w, top + target_h))
-
+        # Resize to target size
+        image = image.resize(IMG_SIZE, Image.Resampling.LANCZOS)
         return np.asarray(image, dtype=np.float32)
 
 
@@ -208,13 +191,13 @@ def main():
     parser.add_argument(
         "--head-epochs",
         type=int,
-        default=2,
+        default=20,
         help="Epochs with a frozen backbone (default: 2 - optimized for convergence)",
     )
     parser.add_argument(
         "--finetune-epochs",
         type=int,
-        default=2,
+        default=20,
         help="Epochs with the top MobileNetV2 layers unfrozen (default: 2 - optimal for this dataset)",
     )
     parser.add_argument(
@@ -241,7 +224,7 @@ def main():
     train_paths, temp_paths, train_labels, temp_labels = train_test_split(
         paths,
         labels,
-        test_size=0.2,
+        test_size=0.3,
         random_state=42,
         stratify=labels,
     )
