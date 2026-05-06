@@ -40,12 +40,12 @@ static camera_config_t get_camera_config()
     config.pin_reset = -1; // RESET_GPIO_NUM
 
     // Clock
-    config.xclk_freq_hz = 16000000; // 16 MHz
+    config.xclk_freq_hz = 10000000; // 10 MHz keeps RGB565 DMA stable while inference is slow.
 
     // Frame buffer settings
     config.fb_location = CAMERA_FB_IN_PSRAM;
-    config.fb_count    = 2;
-    config.grab_mode   = CAMERA_GRAB_LATEST;
+    config.fb_count    = 1;
+    config.grab_mode   = CAMERA_GRAB_WHEN_EMPTY;
 
     // Pixel format: RGB565 is efficient to convert to RGB888
     config.pixel_format = PIXFORMAT_RGB565;
@@ -102,7 +102,9 @@ bool camera_capture_frame(uint8_t *image_buffer)
 
     // Verify buffer size
     if (fb->len < FRAME_W * FRAME_H * FRAME_C) {
-        ESP_LOGE(TAG, "Frame buffer too small: %d bytes, expected at least %d bytes.", fb->len, FRAME_W * FRAME_H * FRAME_C);
+        ESP_LOGW(TAG, "Skipping short frame: %u bytes, expected %u bytes.",
+                 static_cast<unsigned>(fb->len),
+                 static_cast<unsigned>(FRAME_W * FRAME_H * FRAME_C));
         esp_camera_fb_return(fb);
         return false;
     }

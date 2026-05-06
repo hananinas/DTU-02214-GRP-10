@@ -70,8 +70,9 @@ def format_c_array(data: bytes, symbol: str) -> str:
     return "\n".join(lines)
 
 
-def write_model_header(output_dir: Path, threshold: float):
+def write_model_header(output_dir: Path, threshold: float, test_accuracy: float | None):
     width, height = IMG_SIZE
+    accuracy = -1.0 if test_accuracy is None else test_accuracy
     header = f"""#pragma once
 
 #include <stddef.h>
@@ -80,6 +81,7 @@ def write_model_header(output_dir: Path, threshold: float):
 #define MODEL_INPUT_HEIGHT {height}
 #define MODEL_INPUT_CHANNELS 3
 #define MEMBER_THRESHOLD {threshold:.8f}f
+#define MODEL_TEST_ACCURACY {accuracy:.8f}f
 
 extern const unsigned char model_binary[];
 extern const unsigned int model_binary_len;
@@ -108,6 +110,9 @@ def main():
 
     metadata = load_transfer_metadata(args.model)
     threshold = float(metadata.get("threshold", 0.5))
+    test_accuracy = metadata.get("test_accuracy")
+    if test_accuracy is not None:
+        test_accuracy = float(test_accuracy)
     output_tflite = args.output_dir / "model.tflite"
 
     model_bytes = convert_model(
@@ -117,7 +122,7 @@ def main():
     (args.output_dir / "model.c").write_text(
         format_c_array(model_bytes, "model_binary"), encoding="utf-8"
     )
-    write_model_header(args.output_dir, threshold)
+    write_model_header(args.output_dir, threshold, test_accuracy)
 
     summary = {
         "model": str(args.model),
@@ -126,6 +131,7 @@ def main():
         "output_h": str(args.output_dir / "model.h"),
         "bytes": len(model_bytes),
         "threshold": threshold,
+        "test_accuracy": test_accuracy,
         "image_size": list(IMG_SIZE),
     }
     print(json.dumps(summary, indent=2))
